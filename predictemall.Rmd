@@ -1,0 +1,669 @@
+---
+title: "Predict'em all"
+author: "Andrew Lee"
+output: 
+    prettydoc::html_pretty:
+    theme: cayman
+---
+
+# Overview
+
+Pokémon Go is an AR mobile game developed by the result of a collaboration between Niantic, Nintendo, and The Pokémon Company. It uses GPS coordinates to locate, capture, battle, and train Pokémon, which appear as if they are in the player's real-world location. Since 2016, when Pokémon Go first launched, this innovative game has attracted millions of users from all over the world. This project aims to, firstly, find  geographical coordinates corresponding to where Pokémon appeared, secondly, find association rules in the Pokémon sightings, and finally, build a predictive models for the number of Pokémon. The datasets in this project consists of 151 species of Pokémon from Kanto Pokédex and we have roughly 300,000 observations of Pokémon sightings, observed in 2016.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+<br />
+Load packages:
+```{r}
+#devtools::install_github("r-spatial/leafgl")
+
+library(ggthemes)
+
+library(tidyverse)
+library(dplyr)
+library(KernSmooth)
+library(sf)
+library(mapview)
+library(maptools)
+library(leaflet)
+library(leafgl)
+library(rworldmap)
+library(ggmap)
+
+library(arules)
+library(arulesViz)
+library(dplyr)
+
+library(grid)
+library(gridExtra)
+library(ggplot2)
+library(MASS)
+library(faraway)
+library(emmeans)
+```
+
+Load data:
+```{r}
+raw.data = read.csv("300k.csv")
+pokedex = read.csv("pokemon.csv")
+
+# retain only kanto pokemons
+pokedex = pokedex[1:151,]
+names(pokedex)[1] = "pokemonId"
+```
+
+<br />
+<br />
+
+# Geocode Pokémon Locations
+
+Let's firstly geocode Pokémon locations. Here, the longitude and latitude to be plotted using the World Geographic System 1984 projection, which is referenced as European Petroleum Survey Group (EPSG) 4326. The interactive map below is an overview of where Pokémons appeared. You can zoom into the region that you are interested.
+```{r}
+# merge by pokemon ID
+geo.data = merge(x = raw.data, y = pokedex, by = "pokemonId", all.x = TRUE)
+
+# retain only necessary variables
+geo.data = geo.data[,c(1:3,24,214:215)]
+
+pts = st_as_sf(geo.data, coords = c("longitude", "latitude"), crs = 4326)
+
+leaflet() %>%
+  addProviderTiles(provider = providers$OpenStreetMap.Mapnik) %>%
+  addGlPoints(data = pts, group = "pts") %>%
+  addMouseCoordinates() %>%
+  setView(lng = 10.5, lat = 49.5, zoom = 6) %>% 
+  addLayersControl(overlayGroups = "pts")
+```
+
+<br />
+
+#### The geograpic density plot of Pokémon sightings are as below
+```{r, echo = FALSE}
+register_google(key = "AIzaSyAGYBLMjel_lxXQCcM_YI8Qgqh1N6lFVk0")
+```
+
+North America:
+```{r}
+america.map = get_map(location = "USA", zoom = 4, color = "bw", maptype = "roadmap")
+
+ggmap(america.map, extent = "panel", maprange=FALSE) +
+  geom_density2d(data = geo.data, aes(x = longitude, y = latitude)) +
+  stat_density2d(data = geo.data, aes(x = longitude, y = latitude, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 16, geom = 'polygon') +
+  scale_fill_gradient(low = "green", high = "red") +
+  scale_alpha(range = c(0.00, 0.25), guide = FALSE) +
+  theme(legend.position = "none", axis.title = element_blank(), text = element_text(size = 12))
+```
+
+Europe:
+```{r}
+euro.map = get_map(location = "Europe", zoom = 4, color = "bw", maptype = "roadmap")
+
+ggmap(euro.map, extent = "panel", maprange=FALSE) +
+  geom_density2d(data = geo.data, aes(x = longitude, y = latitude)) +
+  stat_density2d(data = geo.data, aes(x = longitude, y = latitude, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 16, geom = 'polygon') +
+  scale_fill_gradient(low = "green", high = "red") +
+  scale_alpha(range = c(0.00, 0.25), guide = FALSE) +
+  theme(legend.position = "none", axis.title = element_blank(), text = element_text(size = 12))
+```
+
+East Asia:
+```{r}
+japan.map = get_map(location = "Japan", zoom = 4, color = "bw", maptype = "roadmap")
+
+ggmap(japan.map, extent = "panel", maprange=FALSE) +
+  geom_density2d(data = geo.data, aes(x = longitude, y = latitude)) +
+  stat_density2d(data = geo.data, aes(x = longitude, y = latitude, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 16, geom = 'polygon') +
+  scale_fill_gradient(low = "green", high = "red") +
+  scale_alpha(range = c(0.00, 0.25), guide = FALSE) +
+  theme(legend.position = "none", axis.title = element_blank(), text = element_text(size = 12))
+```
+
+<br />
+To see more detailed information about Pokémon locations, let's retrieve the country information from the GPS coordinates.
+```{r}
+# The single argument to this function, points, is a data.frame in which:
+#   - column 1 contains the longitude in degrees
+#   - column 2 contains the latitude in degrees
+coords2country = function(points)
+{  
+  countriesSP = getMap(resolution='low') #you could use 'high' res map from rworldxtra if you were concerned about detail
+  pointsSP = SpatialPoints(points, proj4string=CRS(proj4string(countriesSP)))  
+  indices = over(pointsSP, countriesSP)
+
+  indices$ADMIN  #returns country name
+}
+```
+
+```{r}
+geo.data$country = coords2country(geo.data[,c(3,2)])
+```
+
+Let's take a look at Pokémon sightings in Japan, in where the Pokémon Company locates. From the map appeared below, we can easily see where Pokémon appeared, which type of Pokémon appeared, and how was the weather when it appeared.
+
+```{r}
+japan.data = geo.data[which(geo.data$country == 'Japan'),]
+
+coordinates(japan.data) = ~longitude+latitude
+proj4string(japan.data) = CRS("+init=epsg:4326")
+
+mapview(japan.data, zcol = "type_1")
+```
+
+<br />
+<br />
+
+# Association rules 
+
+In this game, it has been well known to players that some Pokémon appears together. So, it is worth describing Pokémon sightings using the association rules. In a nutshell, the association rule summarises data as "what goes with what." For example, in the Pokémon Go, players want to know which Pokémon appears with which Pokémon. In this case, we can build association rules to see the most common rules of Pokémon occurrences. This method is also called _market basket analysis_, since it was originated from the consumer transaction databases to see dependencies between purchases of different items and build the recommendation systems.
+
+### Data Preprocessing
+
+```{r}
+# retain only necessary variables
+associate.data = raw.data[,c(1,57:207)]
+
+
+dim(associate.data)
+head(associate.data[,1:17], 6)
+```
+
+<br />
+Before building the rules, we need to format the raw data into "transactions". We observe that the first column represents the Pokémon appeared, and the rest of 151 columns represent the other Pokémon appeared with. So, I created an empty matrix, 'pokemonID', initially filled with all FALSE. Then, for each row in the matrix, changed the value to TRUE when the column matches the pokemonId from the raw data.
+
+```{r}
+ID = associate.data[,1]
+pokemonID = matrix(FALSE, nrow = 296021, ncol = 151)
+ 
+for(i in 1:296021){
+  pokemonID[i,ID[i]] = TRUE
+}
+```
+
+Since all the other columns in the raw data are stored as factor with level "false" and "true", I also changed the matrix values into boolean.
+
+```{r}
+Boolean = function(x){
+  levels(x) = c(FALSE, TRUE)
+  x = as.logical(x)
+}
+
+associate.data = associate.data[,2:152]
+associate.data = apply(associate.data, 2, Boolean)
+
+dim(associate.data)
+head(associate.data[,1:17], 6)
+```
+
+Then, combined the two matrix and change the name of the each columns as the name of the Pokémon it represents.
+
+```{r}
+occurance.data = associate.data
+occurance.data[,-1] = ((associate.data[,-1] + pokemonID[,-1]) > 0) + 0
+
+colnames(occurance.data) = pokedex[,2]
+head(occurance.data[,1:17], 6)
+```
+
+As we see above, we got a binary matrix in which columns are Pokémon, rows again represent occurrence, and each cell has either a 1 or 0, indicating the presence or absence of a Pokémon in the Pokémon occurrence. For example, the first row in the matrix above indicates that the Bulbasaur co-occurred with Pidgey within 100m distance.
+
+Finally, change the matrix into the transaction list format as below. Each of the rows in the list below is called "item sets." The idea behind the association rule is to examine all the possible rules between items (Pokémon in this project) in an if-then format and select only those indicating some dependencies between the items. We call the "if" part as _antecedent item_ and "then" part as _consequent item_. The antecedent and consequent items consist item sets. For example, in the 8th row below, the antecedent is _Sandshrew_ and the consequent is _Nidoran (male)_. Another possible rule we can see below is "If Machop and Tauros, Then Magikarp." Here the antecednet includes the item set {machop, tauros} and the consequent is {magikarp}.
+
+```{r}
+poke.association = as(occurance.data, "transactions")
+inspect(head(poke.association, 10))
+```
+
+<br />
+
+The _support_ of the association rule is the number of Pokémon that include both the antecedent and consequent item sets. It can be calculated by the percentage of the total number of records in the data set. In addition to support, _confidence_ compares the co-occurence of the antecedent and consequent item sets in the data set to the occurence of the antecedent item sets.
+
+<br />
+
+$\displaystyle \ Confidence = \frac{Number \ of \ item \ sets \ with \ both \ antecedent \ and \ consequent \ items}{Number \ of \ item \ sets \ with \ antecedent \ item \ set}$
+
+<br />
+
+Meanwhile, if the antecedent and consequent item sets are independent, 
+
+<br />
+
+$\displaystyle \frac{Number \ of \ item \ sets \ with \ both \ antecedent \ and \ consequent \ items}{Number \ of \ item \ sets \ with \ antecedent \ item \ set} = \frac{P(antecedent) * P(consequent)}{P(antecedent)}$ 
+
+$= P(consequent)$
+
+<br />
+
+By comparing the confidence of the rule with the $\ P(consequent)$ (the number of records with the consequent item divided by the number of entire records), we can calculate _lift ratio_. Lift ratio greater than 1 means that there are some dependencies between the antecedent and consequent items.
+
+<br />
+
+While there are several other algorithms to build association rules, I used _Apriori algorithm_ of Agrawal et al. The key idea of the algorithm is to begin with generating frequent item sets with just one item (one-item sets) and to recursively generate frequent item sets with two items, then with three items, and so on. Conduct this process until frequent item sets of all sizes are generated.
+
+For the one-item sets, all we need to do is just counting. For each Pokémon, count how many occurance in the data set include the Pokémon. These counts are the supports for the one-item sets. Then drop one-item sets which have support lower than the minimum, all the other one-item sets will consist a list of the frequent one-item sets. As we see below, the most frequent "item" (Pokémon) is Pidgey followed by Rattata and male Nidoran (in the kanto pokedex, only Nidoran has sex).
+
+```{r}
+itemFrequencyPlot(poke.association, topN=20, type='absolute')
+```
+
+To generate frequent two-item sets, we use the list of frequent one-item sets. This is because if a certain one-item set did not exceed the minimum support, any larger size item set that include the one-item set will not exceed the minimum support. To generate _k_ item sets uses the frequent _k_-1 item sets that were generated in the preceding step. Each step requires a single run through the data set, and therefore the Apriori algorithm is very fast even for a large number of unique items in the dataset.
+
+```{r}
+pokemon.rules = apriori(poke.association, parameter = list(support = 0.01, confidence = 0.5))
+pokemon.rules = sort(pokemon.rules, by='confidence', decreasing = TRUE)
+summary(pokemon.rules)
+```
+
+```{r}
+inspect(pokemon.rules[1:10])
+```
+
+<br />
+
+We see that when Weedle, Rattata, Nidoran appeared in a region, it is highly likely to see Pidgey within 100m.
+
+```{r}
+plot(pokemon.rules)
+```
+
+```{r}
+plot(pokemon.rules, method="graph")
+```
+
+Size of the circle represents support and the color represents lift of each association rules.
+
+<br />
+<br />
+
+# Poisson Regression for Pokémon Go
+
+To the players of Pokémon Go, it has been well known that the number of Pokémon we can encounter varies depending on the type of Pokémon and the surrounding conditions. For example, Squirtle belongs to the Water type, so the players could expect to see more Squirtle when they are playing the game nearby lakes or sea. In addition, when the players are nearby pokestop or gym, where players could obtain game items, players can expect to see many Pokémon. 
+
+Meanwhile, if we imagine subdividing all the geolocation into small areas, the probability of encountering a Pokémon in a single subdivided area is small, but the number of areas is many. In this case, Poisson distribution is a good approximation and can be used for predicting the number of Pokémon sightings. So, in this project, I tried to build a regression model which can predict the number of Pokémon sightings, using Poisson distribution.
+
+### Data Preparation
+#### Sum HABCDS of each Pokemons
+
+HABCDS stands for Pokémon's six major stats—HP, Attack, Block (Defense), Contact (Special Attack), Defense (Special Defense), and Speed. The summation of the all 6 HABCDS is often used as IVs, the Individual values, which are instrumental in determining how a Pokémon strong in the battle. In Pokémon Go, it has been well know to the players that Pokémon with large IVs rarely appears, while those with small IVs commonly appears.
+
+```{r}
+BS = apply(pokedex[,9:14], 1, sum)
+pokedex = cbind(pokedex, BS)
+```
+
+```{r}
+# merge by pokemon ID
+raw.data = merge(x = raw.data, y = pokedex, by = "pokemonId", all.x = TRUE)
+
+# pokestopDistanceKm
+raw.data$pokestopDistanceKm[raw.data$pokestopDistanceKm == "?"] = NA
+raw.data$pokestopDistanceKm = as.numeric(paste(raw.data$pokestopDistanceKm))
+```
+
+#### Terrain type
+
+```{r}
+sort(unique(raw.data$terrainType))
+
+p1 = ggplot(data = raw.data, aes(terrainType)) +
+       geom_bar()
+p2 = ggplot(data = raw.data, aes(closeToWater)) +
+       geom_bar()
+
+grid.arrange(p1, p2, ncol = 2, top = "Distribution of Terrain Types")
+```
+
+In the raw data, the terrain type is provided by GLCF Modis Land Cover (numeric). You can find detailed description from here: <https://yceo.yale.edu/modis-land-cover-product-mcd12q1> (See Classification Schemes 1 - 4). As you can see, some of the Terrain types can be merged together. For example, from type 1 to 5, it is reasonable to merge data as forest. This would prevent consumption of the degrees of freedom in the model discussed later.
+
+Also, since players can expect to see water type Pokémon nearby water, if the value of 'closeToWater' is True, then I decided to categorize its terrain type to water.
+
+```{r}
+attach(raw.data)
+raw.data = mutate(raw.data, Terrain = ifelse(closeToWater == TRUE | terrainType == 0 | terrainType == 11, "Water",
+                                             ifelse(terrainType >= 1 & terrainType <= 5, "Forest",
+                                                    ifelse(terrainType >= 7 & terrainType <= 10, "Grass",
+                                                           ifelse(terrainType == 13, "Urban",
+                                                                  ifelse(terrainType == 12 | terrainType == 14, "Cropland", "Barren"))))))
+detach(raw.data)
+```
+
+<br />
+
+An overview of the distribution of the Terrain in the raw data is:
+```{r}
+ggplot(data = raw.data, aes(Terrain)) +
+  geom_bar() +
+  labs(title = "Distribution of Terrain Types in Raw Data")
+```
+
+#### Weather
+
+```{r}
+unique(raw.data$weatherIcon)
+```
+
+According to [Bulbapedia](https://bulbapedia.bulbagarden.net/wiki/Weather), the type of weather in Pokémon Go is partly cloudy, cloudy, rain, windy, fog, and clear. So, I merged some of the values in weatherIcon as below. 
+
+```{r}
+attach(raw.data)
+raw.data = mutate(raw.data, Weather = ifelse(weatherIcon == "partly-cloudy-day" | weatherIcon == "partly-cloudy-night", "partly-cloudy",
+                                             ifelse(weatherIcon == "rain", "rain",
+                                                    ifelse(weatherIcon == "wind", "windy",
+                                                           ifelse(weatherIcon == "clear-night" | weatherIcon == "clear-day", "clear",
+                                                                  ifelse(weatherIcon == "fog", "fog", "cloudy"))))))
+detach(raw.data)
+```
+
+<br />
+
+An overview of the distribution of the Weather in the raw data is: 
+```{r}
+ggplot(data = raw.data, aes(Weather)) +
+  geom_bar() +
+  labs(title = "Distribution of Weather in Raw Data")
+```
+
+```{r, echo=FALSE}
+# retain only the necesary variables
+raw.data = raw.data[,c(1,43,50,209,214:215,236:238)]
+```
+
+#### Summarize by Pokémon sightings
+
+Before we start to build the regression model, we first need to sum over the number of observations in our raw data by each Pokémon according to combinations of conditions (categorical values such as terrain type, weather, etc.). One of the problems I faced on this summarization is that a Pokémon could possibly belong to more than 1 types. For example, Burbasaur belongs to both Grass and Poison type. According to the Niantic team, developer of Pokémon Go, Pokémon of two different types will appear as boosted when it has favorable conditions for either of the types. In other words, if we use only one of two different types, we may miss some important relations between types and conditions in the regression model.
+
+In order to solve this problem, I divided raw data into two different groups; one is Pokémon with single type, and the other is Pokémon with two different types. For the Pokémon with single type, we have no problem on summarizing the number of observations, grouping by Pokémon ID, type, terrain, and weather. On the other hand, for the Pokémon with two different types, I first did the same summarization twice; one is using only first of two different types, and the other is using only second of two different types. So, we have exactly the same datasets with the same order, but different Pokémon types. After that, I generated random integers for each of the Pokémon appearance cases (random integer 1 and 2; the length of the random integers is same as the length of summarization data), and extract rows from two summarized datasets depending on the random integers. Finally, I bound all three datasets, single type Pokémon, first type Pokémon, and second type Pokémon.
+
+```{r}
+# pokemon only with primary type
+primary = raw.data[is.na(raw.data$type_2) == TRUE,]
+# pokemon with both primary and secondary type
+secondary = raw.data[is.na(raw.data$type_2) == FALSE,]
+
+secondary.1 = secondary[,c(1:5,7:9)]
+secondary.2 = secondary[,c(1:4,6:9)]
+
+colnames(primary)[which(names(primary) == "type_1")] = "type"
+colnames(secondary.1)[which(names(secondary.1) == "type_1")] = "type"
+colnames(secondary.2)[which(names(secondary.2) == "type_2")] = "type"
+
+secondary.count.1 = secondary.1 %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  count()
+secondary.count.1 = as.data.frame(secondary.count.1)
+
+pokestop.1 = secondary.1 %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  summarise(pokestop = mean(pokestopDistanceKm, na.rm = TRUE))
+
+gym.1 = secondary.1 %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  summarise(gym = mean(gymDistanceKm, na.rm = TRUE))
+
+BS.1 = secondary.1 %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  summarise(BS = mean(BS))
+
+#Secondary.app.1 is Pokemon with first of their two different types.
+secondary.app.1 = cbind(secondary.count.1, pokestop.1[,5], gym.1[,5], BS.1[,5])
+```
+
+```{r}
+secondary.count.2 = secondary.2 %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  count()
+secondary.count.2 = as.data.frame(secondary.count.2)
+
+pokestop.2 = secondary.2 %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  summarise(pokestop = mean(pokestopDistanceKm, na.rm = TRUE))
+
+gym.2 = secondary.2 %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  summarise(gym = mean(gymDistanceKm, na.rm = TRUE))
+
+BS.2 = secondary.2 %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  summarise(BS = mean(BS))
+
+#Secondary.app.2 is Pokemon with first of their two different types.
+secondary.app.2 = cbind(secondary.count.2, pokestop.2[,5], gym.2[,5], BS.2[,5])
+```
+
+Two datasets have same order, same values. The only difference is ‘type’.
+
+```{r}
+Id = unique(secondary.app.1$pokemonId)
+Id
+```
+
+```{r}
+sample = list()
+
+
+for(i in 1:length(Id)){
+  subset = secondary.app.1[secondary.app.1$pokemonId == Id[i],]
+  set.seed(1123)
+  sample[[i]] = sample.int(2, size = nrow(subset), replace = TRUE)
+}
+
+sample = unlist(sample)
+```
+
+```{r}
+secondary.app.1 = cbind(secondary.app.1, sample)
+secondary.app.1 = secondary.app.1[secondary.app.1$sample == 1,]
+secondary.app.2 = cbind(secondary.app.2, sample)
+secondary.app.2 = secondary.app.2[secondary.app.2$sample == 2,]
+```
+
+```{r}
+secondary.appear = rbind(secondary.app.1, secondary.app.2)
+secondary.appear = secondary.appear[,1:8]
+```
+
+```{r}
+primary.count = primary %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  count()
+primary.count = as.data.frame(primary.count)
+
+pokestop.3 = primary %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  summarise(pokestop = mean(pokestopDistanceKm, na.rm = TRUE))
+
+gym.3 = primary %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  summarise(gym = mean(gymDistanceKm, na.rm = TRUE))
+
+BS.3 = primary %>%
+  group_by(pokemonId, type, Terrain, Weather) %>%
+  summarise(BS = mean(BS))
+
+primary.appear = cbind(primary.count, pokestop.3[,5], gym.3[,5], BS.3[,5])
+```
+
+```{r}
+appear.data = rbind(primary.appear, secondary.appear)
+appear.data$Terrain = as.factor(appear.data$Terrain)
+appear.data$Weather = as.factor(appear.data$Weather)
+```
+
+After summarizing data, I dropped some of the factor levels unused in the dataset. Such leves exist, because there are some legendary Pokémon, which never appears in general. Also, there might be some conditions where there would be no players, such as in desert or high mountains.
+
+```{r}
+appear.data$Terrain = droplevels(appear.data$Terrain)
+appear.data$Weather = droplevels(appear.data$Weather)
+appear.data$type = droplevels(appear.data$type)
+```
+
+<br />
+
+### Some Data Exploration
+A compact overview of the summarized data is:
+```{r}
+summary(appear.data)
+```
+
+  * **type:** type of the appeared Pokémon, there are 17 different types in the dataset, including bug, dragon, and fighting. _factor_
+  * **Terrain:** type of the location where Pokémon appeared, there are 6 different types of terrain. _factor_
+  * **Weather:** type of weather condition when Pokémon appeared, there are 6 different types of weather conditions. _factor_
+  * **pokestop:** average distance to the nearest pokestop by conditions on weather, terrain, and type (in km). _numeric_
+  * **gym:** average distance to the nearest gym by conditions on weather, terrain, and type (in km). _numeric_
+  * **BS:** average IVs by conditions on weather, terrain, and type. _integer_
+  
+  * **n:** the number of Pokémon appeared with the given condition. _integer_
+
+PokeStops and Gym are places in Pokémon Go that allow players to collect items such as eggs and more Poke Balls to capture more Pokemon or battle the Pokémon of rival teams. From the overview above, we notice that there are some outliers in Distance to Pokestop and Distance to Gym. 
+
+```{r}
+head(unique(sort(appear.data$pokestop, decreasing = TRUE)), 30)
+head(unique(sort(appear.data$gym, decreasing = TRUE)), 30)
+```
+
+Since it is not realistic not to see any of Pokestop within 100km, I decided to drop the observations with pokestop greater than 100. Similarly, I decided to drop the observations with gym greater than 100.
+
+```{r}
+appear.data = appear.data[appear.data$pokestop < 100,]
+appear.data = appear.data[appear.data$gym < 100,]
+```
+
+```{r}
+ggplot(appear.data, aes(n)) +
+  geom_histogram() +
+  labs(title = "Histogram of the Pokemon Appearance", x = "Number of Appearances")
+```
+
+<br />
+
+As we can see in the plot above, the number of Pokémon sightings seems to follow Poisson distribution. 
+
+If Y is Poisson with mean $\mu>0$, then $P(Y=y)$=$\displaystyle \frac{e^{-\mu}\mu^y}{y!}$, for y = 0, 1, 2, ... Poison distribution is good approximation for the number of successes with small success probabilities and large totals. In this project, if we see encountering Pokémon in the world as success, the number of Pokémon we could encounter could be approximated by using Poison distribution.
+
+The following plots also shows that the number of sightings of Pokémon might follow Poisson distribution in each of the categorical variable level.
+
+```{r}
+ggplot(appear.data, aes(n, fill = Terrain)) +
+  geom_histogram(binwidth=1000, position="dodge") +
+  labs(x = "Number of Pokémon", title = "Number of Pokémon by Terrain Type")
+```
+
+```{r}
+ggplot(appear.data, aes(n, fill = Weather)) +
+  geom_histogram(binwidth=1000, position="dodge") +
+  labs(x = "Number of Pokémon", title = "Number of Pokémon by Weather Type")
+```
+
+<br />
+<br />
+
+```{r}
+df = appear.data %>%
+  group_by(Terrain, type, Weather) %>%
+  summarize(nvar = var(n), nmean = mean(n))
+
+ggplot(df, aes(x = nmean, y = nvar)) +
+  geom_point() +
+  geom_abline(a = 0, b = 1) +
+  theme_bw() +
+  labs(y = 'variance', x= 'mean')
+```
+
+In Poisson distribution, mean and variance has the same value. However, if we see the plot, we can notice that there is over dispersion. For each levels of means, there is much higher levels of variances in the plot. Quick remedy for this problem is to use Quasi-poisson instead of Poisson distribution in the regression model.
+
+<br />
+
+The number of Pokémon under the combination of type and terrain is as below. We see that the distribution of the number of Pokémon changes depending on the terrain types.
+```{r}
+xtabs(~ Terrain + type, appear.data)
+```
+
+<br />
+
+Similarly, the number of Pokémon under the combination of type and weather is as below. We see that the distribution of the number of Pokémon changes depending on the weather types.
+
+```{r}
+xtabs(~ Weather + type, appear.data)
+```
+
+```{r}
+ggplot(data = appear.data, aes(gym, pokestop)) +
+  geom_point()
+```
+
+In the scatter plot above, we see that there might be some positive correlation between the distance to pokestop and the distance to gym.
+
+<br />
+
+### Model Fitting
+
+In the initial model, we have the interaction term between type and terrain, type and weather. We also have the distance to pokestop, distance to gym, and IVs. Using F-test, we can drop terms which cannot decrease deviance in the number of Pokémon sightings that much.
+
+```{r}
+m1 = glm(n ~ type*Terrain + type*Weather + pokestop + gym + BS, data=appear.data, family = 'quasipoisson')
+drop1(m1, test = "F")
+```
+
+```{r}
+m2 = glm(n ~ type*Terrain + type*Weather + pokestop + BS, data=appear.data, family = 'quasipoisson')
+drop1(m2, test = "F")
+```
+
+```{r}
+m3 = glm(n ~ type*Terrain + type*Weather + BS, data=appear.data, family = 'quasipoisson')
+drop1(m3, test = "F")
+```
+
+<br />
+
+In the final model, we have the interaction term between type and weather, interaction term between type and terrain, IVs. The final model explains about 82% of the deviance.
+
+```{r}
+1 - (m3$deviance/m3$null.deviance)
+```
+
+<br />
+
+### Prediction
+
+```{r}
+#comparisons
+emmip(m3, type~Terrain)
+emmip(m3, type~Weather)
+```
+
+We see that clear interaction between type and terrain. Although for most of the types, linear prediction goes same by the levels of weather, some of the Pokémon types shows different pattern depending on weather levels. For example, compared to the clear days, while all types of Pokémon has less linear prediction in cloudy days, the flying type Pokémon in those days appears more than the other types. Note that the Linear prediction in the above plots are not the number of Pokémon, but the exponents. 
+
+```{r}
+new.data = data.frame(
+  BS = rep(seq(from = min(appear.data$BS), to = max(appear.data$BS), length.out = 170), 6),
+  type = factor(rep(1:17, each = 60), levels = 1:17, labels = levels(appear.data$type)),
+  Terrain = factor(rep(1:6, each = 170), levels = 1:6, labels = levels(appear.data$Terrain)),
+  Weather = factor(rep(1:6, each = 170), levels = 1:6, labels = levels(appear.data$Weather)))
+
+new.data = cbind(new.data, predict(m3, new.data, type = "link", se.fit=TRUE))
+new.data = within(new.data, {
+  n = exp(fit)
+})
+
+ggplot(new.data, aes(BS, n)) +
+  geom_line(aes(color = type), size = 1) +
+  labs(x = "IVs", y = "Predicted Number of Pokemons") +
+  theme(legend.position="bottom")
+
+ggplot(new.data, aes(BS, n)) +
+  geom_line(aes(color = Terrain), size = 1) +
+  labs(x = "IVs", y = "Predicted Number of Pokemons")
+
+ggplot(new.data, aes(BS, n)) +
+  geom_line(aes(color = Weather), size = 1) +
+  labs(x = "IVs", y = "Predicted Number of Pokemons")
+```
+
+We see that as IVs increases, the number of Pokémon sightings rapidly decreases. Clearly, it is very hard to see Pokémon whose IVs is greater than 300.
+
+Project files:
+<https://github.com/aleedk1123/rpokemongo>
